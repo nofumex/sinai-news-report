@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
+from referral_control import ReferralControl
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / '.env', encoding='utf-8-sig')
@@ -110,14 +111,14 @@ def field_manager(lead: dict, manager_field_id: int = 0) -> str:
 
 
 def resolve_lead_manager(lead: dict, users: dict[int, str], field_id: int = 0) -> tuple[str | None, str, str]:
-    """Owner whitelist wins; otherwise use field Manager, never fall back to other owners."""
+    """Use the configured Manager field first, then the deal's responsible user."""
     owner = users.get(int(lead.get('responsible_user_id') or 0), '')
-    match = resolve_manager(owner)
     brief = field_manager(lead, field_id)
-    if match:
-        return match, 'ответственный', owner
     manager = resolve_manager(brief)
-    return manager, ('Бриф → Менеджер' if manager else 'не определён'), (brief or owner or 'пусто')
+    if manager:
+        return manager, 'поле Менеджер', brief
+    match = resolve_manager(owner)
+    return match, ('ответственный' if match else 'не определён'), (owner or brief or 'пусто')
 
 
 def day_bounds(day: date, timezone: ZoneInfo) -> tuple[float, float]:
@@ -186,7 +187,7 @@ class Config:
                    state=absolute('REPORT_STATE_PATH', './data/report_state.sqlite3'),
                    amo_url=base, amo_token=os.getenv('AMOCRM_ACCESS_TOKEN', '').strip(),
                    tz=ZoneInfo(os.getenv('TIMEZONE', 'Asia/Krasnoyarsk')),
-                   report_at=dtime(h, m), manager_field_id=int(os.getenv('MANAGER_FIELD_ID', '0')),
+                   report_at=dtime(h, m), manager_field_id=int(os.getenv('MANAGER_FIELD_ID', '518097')),
                    refresh_after=max(60, int(os.getenv('CACHE_TTL_SECONDS', '900'))),
                    workers=max(1, min(5, int(os.getenv('CRM_WORKERS', '4')))))
 
@@ -497,6 +498,7 @@ class Telegram:
 class ReportService:
     def __init__(self, cfg: Config, state: State, tg: Telegram):
         self.cfg, self.state, self.tg = cfg, state, tg
+        self.referrals: ReferralControl | None = None
         self.api = Api(cfg)
         self.jobs: queue.Queue[date] = queue.Queue()
         self.mu = threading.RLock()
@@ -545,6 +547,8 @@ class ReportService:
         total = sum(values[0] for values in snapshot['counts'].values())
         daily = sum(values[1] for values in snapshot['counts'].values())
         lines.extend(['', f'👥 <b>Итого: {total}</b> · +{daily} за день'])
+        if self.referrals:
+            lines.extend(['', *self.referrals.daily_lines(day)])
         if stale:
             lines.append('⏳ Обновляю данные…')
         return '\n'.join(lines)
@@ -747,6 +751,8 @@ class App:
         self.state = State(cfg.state)
         self.tg = Telegram(cfg)
         self.svc = ReportService(cfg, self.state, self.tg)
+        self.referrals = ReferralControl(cfg, self.state, self.tg, self.svc.api)
+        self.svc.referrals = self.referrals
         self.restored_daily: set[tuple[date, int, int]] = set()
 
     def menu(self, chat: int, mid: int | None = None) -> None:
@@ -782,9 +788,11 @@ class App:
 
     def handle(self, update: dict) -> None:
         callback = update.get('callback_query')
-        msg = (callback or {}).get('message') or update.get('message') or {}
+        msg = (callback or {}).get('message') or update.get('message') or update.get('edited_message') or {}
         chat_obj = msg.get('chat') or {}
         chat = int(chat_obj.get('id', 0))
+        if not callback and self.referrals.handle_message(msg):
+            return
         who = (callback or update.get('message') or {}).get('from') or {}
         is_auth = (chat_obj.get('type') == 'private' and int(who.get('id', 0)) in self.cfg.allowed
                    and int(who.get('id', 0)) == chat)
@@ -806,6 +814,24 @@ class App:
             elif payload == 'status':
                 self.tg.edit(chat, mid, self.svc.status_text(),
                              {'inline_keyboard': [[{'text': '🏠 Меню', 'callback_data': 'home'}]]})
+            elif payload.startswith('month:'):
+                month = payload.split(':', 1)[1]
+                try:
+                    datetime.strptime(month, '%Y-%m')
+                    self.tg.edit(chat, mid, self.referrals.monthly_text(month),
+                                 self.referrals.monthly_markup(month))
+                except ValueError:
+                    self.tg.edit(chat, mid, 'Некорректный месяц.',
+                                 {'inline_keyboard': [[{'text': '🏠 Меню', 'callback_data': 'home'}]]})
+            elif payload.startswith('pen:'):
+                try:
+                    _, month, idx, page = payload.split(':')
+                    datetime.strptime(month, '%Y-%m')
+                    screen, buttons = self.referrals.manager_page(month, int(idx), int(page))
+                    self.tg.edit(chat, mid, screen, buttons)
+                except (ValueError, KeyError):
+                    self.tg.edit(chat, mid, 'Некорректные данные. Вернитесь к месячному отчёту.',
+                                 {'inline_keyboard': [[{'text': '🏠 Меню', 'callback_data': 'home'}]]})
             elif payload.startswith('m:'):
                 try:
                     _, date_str, idx, page = payload.split(':')
@@ -875,6 +901,12 @@ class App:
                         day = delivery_date - timedelta(days=1)
 
                         try:
+                            # Refresh only filtered status-change events; CRM failure must not block subscription reporting.
+                            self.referrals.sync()
+                        except Exception:
+                            LOG.exception('Daily referral sync failed; using saved data')
+
+                        try:
                             mid = self.tg.send(
                                 chat,
                                 self.svc.format_report(day, self.state.snapshot(day)),
@@ -887,6 +919,24 @@ class App:
                             continue
 
                         self.state.mark_daily(delivery_date, chat, 'delivered', mid)
+
+                month = self.referrals.monthly_due(now)
+                if month:
+                    try:
+                        self.referrals.sync()
+                    except Exception:
+                        LOG.exception('Monthly referral sync failed; using saved data')
+                    for chat in sorted(manager_ids):
+                        if not self.referrals.claim_monthly(month, chat):
+                            continue
+                        try:
+                            mid = self.tg.send(chat, self.referrals.monthly_text(month),
+                                               self.referrals.monthly_markup(month))
+                        except Exception:
+                            self.referrals.mark_monthly(month, chat, 'unknown')
+                            LOG.exception('Monthly Telegram send uncertain: month=%s chat=%s', month, chat)
+                        else:
+                            self.referrals.mark_monthly(month, chat, 'delivered', mid)
 
                 # Restore pending daily placeholders for managers only.
                 for delivery_date, chat, mid in self.state.pending_daily():
@@ -931,11 +981,13 @@ class App:
         threading.Thread(target=self.svc.work, daemon=True, name='crm-reports').start()
         threading.Thread(target=self.daily_loop, daemon=True, name='daily-scheduler').start()
         threading.Thread(target=self.precompute_loop, daemon=True, name='report-precompute').start()
+        if self.referrals.enabled:
+            threading.Thread(target=self.referrals.loop, daemon=True, name='referral-control').start()
         offset = self.state.offset()
         while True:
             try:
                 updates = self.tg.call('getUpdates', offset=offset, timeout=25,
-                                       allowed_updates=['message', 'callback_query'], limit=100)
+                                       allowed_updates=['message', 'edited_message', 'callback_query'], limit=100)
                 for upd in updates:
                     new_offset = int(upd['update_id']) + 1
                     try:

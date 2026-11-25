@@ -1,0 +1,35 @@
+{
+  "manager_field_id": 518097,
+  "managers": [
+    {
+      "name": "Павел",
+      "amo_id": 2328073,
+      "telegram_id": 6875793727
+    },
+    {
+      "name": "Ольга Шевелева",
+      "amo_id": 3298921,
+      "telegram_id": 1062804251
+    },
+    {
+      "name": "Юлия Миллер",
+      "amo_id": 8476783,
+      "telegram_id": 5222576835
+    },
+    {
+      "name": "Юлия Дегтярева",
+      "amo_id": 7074220,
+      "telegram_id": 434247268
+    }
+  ],
+  "referral_stage": {
+    "pipeline_name": "Отдел продаж",
+    "pipeline_id": 0,
+    "status_name": "сарафан",
+    "status_id": 0,
+    "poll_seconds": 60,
+    "penalty_rub": 500,
+    "page_size": 5,
+    "monthly_report_time": "23:59"
+  }
+}
