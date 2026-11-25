@@ -1,0 +1,33 @@
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+data/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets and environment
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/*
+!data/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Backups
+*.bak
+*.backup
+*.before_*
