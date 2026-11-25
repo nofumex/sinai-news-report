@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any
 
 LOG = logging.getLogger("sinai-report.referrals")
+EVENT_BACKFILL_VERSION = "4"
+USER_REPORT_RULES_VERSION = "1"
 MONTHS_RU = (
     "январь", "февраль", "март", "апрель", "май", "июнь",
     "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
@@ -26,12 +28,8 @@ MONTHS_RU = (
 
 
 def parse_report_deal_id(text: object) -> int | None:
-    """Accept a three-line report whose first non-empty line contains its deal ID."""
-    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
-    if len(lines) < 3:
-        return None
-    match = re.fullmatch(r"(?:\d{1,2}[.)]\s*)?(\d{6,12})", lines[0])
-    return int(match.group(1)) if match else None
+    matches = re.findall(r"(?<!\d)(\d{6,12})(?!\d)", str(text or ""))
+    return int(matches[0]) if matches else None
 
 
 def parse_clock(value: str, default: str) -> tuple[int, int]:
@@ -106,6 +104,9 @@ class ReferralControl:
                     report_day TEXT NOT NULL, lead_id INTEGER NOT NULL,
                     reporter_tg_id INTEGER NOT NULL, submitted_at REAL NOT NULL,
                     message_text TEXT NOT NULL,
+                    deal_day TEXT, submitted_day TEXT,
+                    is_late INTEGER NOT NULL DEFAULT 0,
+                    manager_name TEXT, manager_amo_id INTEGER, manager_tg_id INTEGER,
                     PRIMARY KEY (chat_id, message_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_referral_entries_day
@@ -119,6 +120,57 @@ class ReferralControl:
                     PRIMARY KEY (report_month, chat_id)
                 );
             """)
+            cols = {r[1] for r in self.state.db.execute(
+                "PRAGMA table_info(referral_reports)"
+            )}
+            for col, definition in (
+                ("deal_day", "TEXT"),
+                ("submitted_day", "TEXT"),
+                ("is_late", "INTEGER NOT NULL DEFAULT 0"),
+                ("manager_name", "TEXT"),
+                ("manager_amo_id", "INTEGER"),
+                ("manager_tg_id", "INTEGER"),
+            ):
+                if col not in cols:
+                    self.state.db.execute(
+                        f"ALTER TABLE referral_reports ADD COLUMN {col} {definition}"
+                    )
+
+            self.state.db.execute(
+                "UPDATE referral_reports SET submitted_day=COALESCE(submitted_day,report_day)"
+            )
+            self.state.db.execute("""
+                UPDATE referral_reports SET
+                    deal_day=COALESCE(deal_day,(
+                        SELECT e.report_day FROM referral_entries e
+                        WHERE e.lead_id=referral_reports.lead_id
+                        ORDER BY e.event_at LIMIT 1
+                    )),
+                    manager_name=COALESCE(manager_name,(
+                        SELECT e.manager_name FROM referral_entries e
+                        WHERE e.lead_id=referral_reports.lead_id
+                        ORDER BY e.event_at LIMIT 1
+                    )),
+                    manager_amo_id=COALESCE(manager_amo_id,(
+                        SELECT e.manager_amo_id FROM referral_entries e
+                        WHERE e.lead_id=referral_reports.lead_id
+                        ORDER BY e.event_at LIMIT 1
+                    )),
+                    manager_tg_id=COALESCE(manager_tg_id,(
+                        SELECT e.manager_tg_id FROM referral_entries e
+                        WHERE e.lead_id=referral_reports.lead_id
+                        ORDER BY e.event_at LIMIT 1
+                    ))
+            """)
+            self.state.db.execute("""
+                UPDATE referral_reports SET is_late=CASE
+                    WHEN deal_day IS NOT NULL AND submitted_day>deal_day
+                    THEN 1 ELSE 0 END
+            """)
+            self.state.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_referral_reports_lead "
+                "ON referral_reports(lead_id,submitted_at)"
+            )
         if not self.enabled:
             LOG.warning("Контроль сарафана отключён: задайте REPORTS_GROUP_CHAT_ID в .env")
         else:
@@ -176,6 +228,17 @@ class ReferralControl:
                  pipeline.get("name"), self.pipeline_id, status_matches[0].get("name"), self.status_id)
         return self.pipeline_id, self.status_id
 
+    def _initial_backfill_cursor(self, now: int) -> int:
+        """Start at the first day of the previous month, including the current month.
+
+        This also repairs installations created by the earlier buggy version, which
+        persisted a cursor near startup and silently skipped pre-install events.
+        """
+        local_date = datetime.fromtimestamp(now, self.cfg.tz).date()
+        previous_month_last_day = local_date.replace(day=1) - timedelta(days=1)
+        first_day = previous_month_last_day.replace(day=1)
+        return int(datetime.combine(first_day, datetime.min.time(), self.cfg.tz).timestamp())
+
     def _target_events(self, cursor: int) -> list[dict]:
         pipeline_id, status_id = self._target_stage()
         params = {
@@ -199,37 +262,76 @@ class ReferralControl:
         return found
 
     def _manager_for_lead(self, lead: dict | None) -> dict | None:
+        """Manager field 518097 has priority; amoCRM responsible is fallback."""
         if not lead:
             return None
-        # The explicitly supplied "Менеджер" field wins; the deal's responsible user is fallback.
+
+        manager_ids = {
+            "миллер": 8476783,
+            "дегтярева": 7074220,
+            "шевелева": 3298921,
+            "карепов": 2328073,
+            "павел": 2328073,
+        }
+
         for field in lead.get("custom_fields_values") or []:
-            if int(field.get("field_id") or 0) != self.manager_field_id:
-                continue
-            for item in field.get("values") or []:
-                raw = item.get("value")
-                if isinstance(raw, dict):
-                    candidate_id = raw.get("id") or raw.get("value")
-                    if str(candidate_id or "").isdigit() and int(candidate_id) in self.manager_by_amo:
-                        return self.manager_by_amo[int(candidate_id)]
-                    raw = raw.get("name") or raw.get("value") or ""
-                if str(raw or "").strip().isdigit():
-                    candidate = self.manager_by_amo.get(int(str(raw).strip()))
-                    if candidate:
-                        return candidate
-                norm = _normal(raw)
-                if not norm:
+            try:
+                if int(field.get("field_id") or 0) != 518097:
                     continue
-                tokens = set(norm.split())
-                matches = []
-                for manager in self.managers:
-                    full_tokens = set(_normal(manager["name"]).split())
-                    surname = _normal(manager["name"]).split()[-1]
-                    is_pavel_alias = manager["name"] == "Павел" and "карепов" in tokens
-                    if full_tokens.issubset(tokens) or surname in tokens or is_pavel_alias:
-                        matches.append(manager)
-                if len(matches) == 1:
-                    return matches[0]
-        return self.manager_by_amo.get(int(lead.get("responsible_user_id") or 0))
+            except (TypeError, ValueError):
+                continue
+
+            for item in field.get("values") or []:
+                value = item.get("value", "")
+                if isinstance(value, dict):
+                    value = value.get("name") or value.get("value") or ""
+
+                normalized = str(value).strip().casefold().replace("ё", "е")
+                if not normalized:
+                    continue
+
+                parts = re.split(r"\s*[-–—]\s*", normalized, maxsplit=1)
+                primary = parts[0] if len(parts) > 1 else normalized
+                tokens = set(re.findall(r"[а-яa-z]+", primary))
+
+                amo_id = next(
+                    (mid for surname, mid in manager_ids.items()
+                     if surname in tokens),
+                    None
+                )
+
+                if amo_id is not None:
+                    manager = (
+                        self.manager_by_amo.get(amo_id)
+                        or self.manager_by_amo.get(str(amo_id))
+                    )
+                    if manager:
+                        return manager
+
+        try:
+            responsible_id = int(lead.get("responsible_user_id") or 0)
+        except (TypeError, ValueError):
+            return None
+
+        return (
+            self.manager_by_amo.get(responsible_id)
+            or self.manager_by_amo.get(str(responsible_id))
+        )
+    def _link_reports_to_entry(self, lead_id: int, report_day: str,
+                               manager: dict | None) -> None:
+        with self.state.mu, self.state.db:
+            self.state.db.execute(
+                "UPDATE referral_reports SET deal_day=?, manager_name=?, "
+                "manager_amo_id=?, manager_tg_id=?, "
+                "is_late=CASE WHEN COALESCE(submitted_day,report_day)>? "
+                "THEN 1 ELSE 0 END WHERE lead_id=?",
+                (report_day,
+                 manager.get("name") if manager else None,
+                 int(manager["amo_id"]) if manager else None,
+                 int(manager["telegram_id"]) if manager else None,
+                 report_day, lead_id)
+            )
+
 
     def sync(self) -> int:
         """Fetch only matching stage-change events since the persisted cursor."""
@@ -239,7 +341,15 @@ class ReferralControl:
         try:
             now = int(time.time())
             cursor_raw = self._meta("amo_event_cursor")
-            cursor = int(cursor_raw) if cursor_raw else now
+            backfill_version = self._meta("amo_event_backfill_version")
+            if backfill_version != EVENT_BACKFILL_VERSION:
+                cursor = self._initial_backfill_cursor(now)
+                LOG.warning(
+                    "Выполняется первичная/восстановительная загрузка событий amoCRM с %s",
+                    datetime.fromtimestamp(cursor, self.cfg.tz).strftime("%d.%m.%Y %H:%M"),
+                )
+            else:
+                cursor = int(cursor_raw) if cursor_raw else now - 300
             events = self._target_events(cursor)
             newest = cursor
             inserted = 0
@@ -256,14 +366,24 @@ class ReferralControl:
                 with self.state.mu:
                     exists = self.state.db.execute(
                         "SELECT 1 FROM referral_events WHERE event_id=?", (event_id,)).fetchone()
-                if exists:
-                    continue
                 try:
                     lead = self.api.crm(f"/api/v4/leads/{lead_id}")
                 except LookupError:
                     lead = None
                 manager = self._manager_for_lead(lead)
                 report_day = datetime.fromtimestamp(event_at, self.cfg.tz).date().isoformat()
+                if exists:
+                    with self.state.mu, self.state.db:
+                        self.state.db.execute(
+                            "UPDATE referral_entries SET manager_name=?, manager_amo_id=?, "
+                            "manager_tg_id=? WHERE lead_id=? AND report_day=?",
+                            (manager.get("name") if manager else None,
+                             int(manager["amo_id"]) if manager else None,
+                             int(manager["telegram_id"]) if manager else None,
+                             lead_id, report_day)
+                        )
+                    self._link_reports_to_entry(lead_id, report_day, manager)
+                    continue
                 with self.state.mu, self.state.db:
                     cur = self.state.db.execute(
                         "INSERT OR IGNORE INTO referral_events(event_id,lead_id,event_at,report_day) VALUES(?,?,?,?)",
@@ -278,10 +398,13 @@ class ReferralControl:
                              int(manager["amo_id"]) if manager else None,
                              int(manager["telegram_id"]) if manager else None))
                         inserted += 1
+                self._link_reports_to_entry(lead_id, report_day, manager)
                 if manager is None:
                     LOG.warning("Не определён менеджер для сделки %s из события %s", lead_id, event_id)
             # Keep a small overlap for events that arrive late or share the same second; event IDs deduplicate it.
             self._set_meta("amo_event_cursor", max(cursor, now - 300, newest - 300))
+            # Only mark history as initialized after the full paginated API request succeeded.
+            self._set_meta("amo_event_backfill_version", EVENT_BACKFILL_VERSION)
             self.last_sync = time.time()
             self.last_error = ""
             if inserted:
@@ -303,32 +426,70 @@ class ReferralControl:
             time.sleep(self.poll_seconds)
 
     def handle_message(self, message: dict) -> bool:
-        """Capture one report message from the configured group; return True for that group."""
         chat = message.get("chat") or {}
         chat_id = int(chat.get("id") or 0)
+
         if chat.get("type") not in ("group", "supergroup"):
             return False
-        if not self.group_chat_id:
-            LOG.warning("Получено сообщение из группы %s; задайте REPORTS_GROUP_CHAT_ID", chat_id)
+        if not self.group_chat_id or chat_id != self.group_chat_id:
             return False
-        if chat_id != self.group_chat_id:
-            return False
-        sender_id = int((message.get("from") or {}).get("id") or 0)
-        manager = self.manager_by_tg.get(sender_id)
+
+        sender = message.get("from") or {}
+        sender_id = int(sender.get("id") or 0)
+        sender_chat = message.get("sender_chat") or {}
         body = message.get("text") or message.get("caption") or ""
         deal_id = parse_report_deal_id(body)
-        if manager and deal_id:
-            stamp = int(message.get("date") or message.get("edit_date") or time.time())
-            day = datetime.fromtimestamp(stamp, self.cfg.tz).date().isoformat()
-            with self.state.mu, self.state.db:
-                self.state.db.execute(
-                    "INSERT INTO referral_reports(chat_id,message_id,report_day,lead_id,reporter_tg_id,submitted_at,message_text) "
-                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(chat_id,message_id) DO UPDATE SET "
-                    "report_day=excluded.report_day,lead_id=excluded.lead_id,reporter_tg_id=excluded.reporter_tg_id,"
-                    "submitted_at=excluded.submitted_at,message_text=excluded.message_text",
-                    (chat_id, int(message.get("message_id") or 0), day, deal_id, sender_id, stamp, str(body)))
-            LOG.info("Referral report received: manager=%s deal=%s day=%s", manager["name"], deal_id, day)
+
+        if not deal_id:
+            LOG.info("Referral message ignored: deal ID not found, message_id=%s",
+                     message.get("message_id"))
+            return True
+
+        stamp = int(message.get("date") or message.get("edit_date") or time.time())
+        submitted_day = datetime.fromtimestamp(
+            stamp, self.cfg.tz
+        ).date().isoformat()
+
+        with self.state.mu, self.state.db:
+            entry = self.state.db.execute(
+                "SELECT report_day,manager_name,manager_amo_id,manager_tg_id "
+                "FROM referral_entries WHERE lead_id=? ORDER BY event_at LIMIT 1",
+                (deal_id,)
+            ).fetchone()
+
+            deal_day = entry["report_day"] if entry else None
+            manager_name = entry["manager_name"] if entry else None
+            manager_amo_id = entry["manager_amo_id"] if entry else None
+            manager_tg_id = entry["manager_tg_id"] if entry else None
+            is_late = int(bool(deal_day and submitted_day > deal_day))
+
+            self.state.db.execute(
+                "INSERT INTO referral_reports("
+                "chat_id,message_id,report_day,lead_id,reporter_tg_id,"
+                "submitted_at,message_text,deal_day,submitted_day,is_late,"
+                "manager_name,manager_amo_id,manager_tg_id"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(chat_id,message_id) DO UPDATE SET "
+                "report_day=excluded.report_day,lead_id=excluded.lead_id,"
+                "reporter_tg_id=excluded.reporter_tg_id,submitted_at=excluded.submitted_at,"
+                "message_text=excluded.message_text,deal_day=excluded.deal_day,"
+                "submitted_day=excluded.submitted_day,is_late=excluded.is_late,"
+                "manager_name=excluded.manager_name,manager_amo_id=excluded.manager_amo_id,"
+                "manager_tg_id=excluded.manager_tg_id",
+                (chat_id, int(message.get("message_id") or 0), submitted_day,
+                 deal_id, sender_id, stamp, str(body), deal_day, submitted_day,
+                 is_late, manager_name, manager_amo_id, manager_tg_id)
+            )
+
+        LOG.info(
+            "Referral report saved: deal=%s responsible_manager=%s sender_id=%s "
+            "sender_chat_id=%s deal_day=%s submitted_day=%s late=%s",
+            deal_id, manager_name or "not-yet-resolved", sender_id,
+            sender_chat.get("id"), deal_day or "not-yet-synced",
+            submitted_day, bool(is_late)
+        )
         return True
+
 
     def _missing_for_range(self, start: date, end: date) -> tuple[dict[str, list[int]], list[int], int]:
         missing = {m["name"]: [] for m in self.managers}
@@ -345,10 +506,9 @@ class ReferralControl:
                 # The business rule is calendar-day based: a same-day report counts
                 # even if the manager posted it shortly before the CRM stage change.
                 reported = self.state.db.execute(
-                    "SELECT 1 FROM referral_reports WHERE report_day=? "
-                    "AND lead_id=? AND reporter_tg_id=? LIMIT 1",
-                    (str(row["report_day"]), int(row["lead_id"]),
-                     int(row["manager_tg_id"]))).fetchone()
+                    "SELECT 1 FROM referral_reports WHERE lead_id=? LIMIT 1",
+                    (int(row["lead_id"]),)
+                ).fetchone()
                 if not reported:
                     missing[row["manager_name"]].append(int(row["lead_id"]))
         for ids in missing.values():
@@ -360,7 +520,12 @@ class ReferralControl:
         stage = f"<b>«{html.escape(self.pipeline_name)} / {html.escape(self.status_name)}»</b>"
         if not self.enabled:
             return ["⚠️ Контроль отчётов по сарафану отключён: задайте REPORTS_GROUP_CHAT_ID в .env."]
-        missing, unassigned, _total = self._missing_for_range(day, day)
+        if self._meta("amo_event_backfill_version") != EVENT_BACKFILL_VERSION:
+            return [
+                "⚠️ <b>Сверка с историей amoCRM ещё не завершена.</b>",
+                "Бот не подтверждает отсутствие пропусков, пока не загрузит историю переходов в этап.",
+            ]
+        missing, unassigned, total = self._missing_for_range(day, day)
         lines: list[str] = []
         for manager in self.managers:
             name = manager["name"]
@@ -381,6 +546,8 @@ class ReferralControl:
         if self.last_error:
             lines.append("⚠️ <b>Последняя сверка с amoCRM завершилась ошибкой.</b> Показаны последние сохранённые данные; полный статус отчётов не подтверждён.")
             lines.append(html.escape(self.last_error[:220]))
+        elif total == 0:
+            lines.append(f"ℹ️ По журналу событий amoCRM за {label} не найдено переходов сделок в {stage}.")
         elif not any(missing.values()) and not unassigned:
             lines.append(f"📄 Отчёт по всем сделкам из {stage} за {label} предоставлен.")
         else:
